@@ -1,0 +1,265 @@
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      buildid:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      image_branch:
+        type: string
+        required: true
+      branches:
+        description: Comma-separated meta-server branches that point at this build
+        type: string
+        required: true
+      update_path:
+        type: string
+        required: true
+      chunks_store_path:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+      meta_url:
+        type: string
+        required: true
+      images_url:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+env:
+  BUILDID: ${{ inputs.buildid }}
+  VERSION: ${{ inputs.version }}
+  IMAGE_BRANCH: ${{ inputs.image_branch }}
+  BRANCHES: ${{ inputs.branches }}
+  UPDATE_PATH: ${{ inputs.update_path }}
+  CHUNKS_STORE_PATH: ${{ inputs.chunks_store_path }}
+  IMAGE: ${{ inputs.image }}
+  META_URL: ${{ inputs.meta_url }}
+  IMAGES_URL: ${{ inputs.images_url }}
+  USER_AGENT: holo-deckard (+${{ github.server_url }}/${{ github.repository }})
+
+jobs:
+  build:
+    name: ${{ inputs.buildid }}
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force > /dev/null
+          df -h /
+
+      - name: Install tools
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq squashfs-tools
+          tag=$(gh release view -R folbricht/desync --json tagName -q .tagName)
+          echo "desync $tag"
+          mkdir -p "$RUNNER_TEMP/desync"
+          cd "$RUNNER_TEMP/desync"
+          gh release download "$tag" -R folbricht/desync -p "desync_*_linux_arm64.tar.gz" -p checksums.txt
+          sha256sum -c --ignore-missing checksums.txt
+          sudo tar -xzf desync_*_linux_arm64.tar.gz -C /usr/local/bin desync
+
+      - name: Check pinned keys
+        run: |
+          while read -r fp file; do
+            actual=$(openssl x509 -in "keys/$file" -noout -fingerprint -sha256 | cut -d= -f2)
+            if [ "$actual" != "$fp" ]; then
+              echo "::error::fingerprint mismatch for keys/$file"
+              exit 1
+            fi
+          done < keys/fingerprints
+
+      - name: Download and verify bundle
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL --retry 5 -A "$USER_AGENT" -o bundle.raucb "${IMAGES_URL%/}/${UPDATE_PATH}"
+          size=$(stat -c %s bundle.raucb)
+          sig_size=$(tail -c 8 bundle.raucb | od -An -t u8 --endian=big | tr -d ' ')
+          head -c "$((size - sig_size - 8))" bundle.raucb > bundle.sqfs
+          tail -c "$((sig_size + 8))" bundle.raucb > bundle.tail
+          head -c "$sig_size" bundle.tail > bundle.sig
+          cat "$GITHUB_WORKSPACE"/keys/*.pem > trusted.pem
+          openssl cms -verify -binary -inform DER -in bundle.sig -content bundle.sqfs \
+            -CAfile trusted.pem -purpose any -out /dev/null
+          openssl pkcs7 -inform DER -in bundle.sig -print_certs | openssl x509 -noout -subject
+          unsquashfs -q -d bundle bundle.sqfs
+          grep -qx 'compatible=steamos-aarch64' bundle/manifest.raucm
+          echo "ROOTFS_SHA256=$(sed -n 's/^sha256=//p' bundle/manifest.raucm)" >> "$GITHUB_ENV"
+          rm bundle.raucb bundle.sqfs bundle.tail
+
+      - name: Read build manifest
+        run: |
+          url="${IMAGES_URL%/}/${UPDATE_PATH%.raucb}.manifest.json"
+          if manifest=$(curl -fsSL --retry 3 -A "$USER_AGENT" "$url"); then
+            {
+              echo "GITSHA=$(jq -r '.gitsha // empty' <<< "$manifest")"
+              echo "STEAMVR_VERSION=$(jq -r '.steamvr_version // empty' <<< "$manifest")"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::no build manifest at $url"
+          fi
+
+      - name: Reconstruct rootfs
+        working-directory: ${{ runner.temp }}
+        run: |
+          desync extract -n 16 -s "${IMAGES_URL%/}/${CHUNKS_STORE_PATH}/" bundle/rootfs.img.caibx rootfs.img
+          echo "${ROOTFS_SHA256}  rootfs.img" | sha256sum -c -
+          du -h rootfs.img
+          df -h /
+
+      - name: Mount rootfs
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p upper work
+          sudo mkdir -p /mnt/lower /mnt/root
+          sudo mount -o ro,loop rootfs.img /mnt/lower
+          sudo mount -t overlay overlay -o "lowerdir=/mnt/lower,upperdir=$RUNNER_TEMP/upper,workdir=$RUNNER_TEMP/work" /mnt/root
+
+      - name: Check update server hosts
+        run: |
+          conf=/mnt/root/usr/lib/steamos-atomupd/client.conf
+          img_meta=$(sed -n 's/^MetaUrl *= *//p' "$conf")
+          img_images=$(sed -n 's/^ImagesUrl *= *//p' "$conf")
+          if [ "${img_meta%/}" != "${META_URL%/}" ]; then
+            echo "::warning::image uses MetaUrl=$img_meta but the workflow uses $META_URL"
+          fi
+          if [ "${img_images%/}" != "${IMAGES_URL%/}" ]; then
+            echo "::warning::image uses ImagesUrl=$img_images but the workflow uses $IMAGES_URL"
+          fi
+          desync_conf=/mnt/root/etc/desync/config.json
+          host=$(sed -E 's#^https?://([^/]+).*#\1#' <<< "$IMAGES_URL")
+          if [ -f "$desync_conf" ] && ! jq -e --arg h "$host" '."store-options" // {} | keys | any(contains($h))' "$desync_conf" > /dev/null; then
+            echo "::warning::$desync_conf does not reference $host"
+          fi
+
+      - name: Sanitize
+        run: |
+          sudo python3 scripts/sanitize.py /mnt/root \
+            --secrets-out "$RUNNER_TEMP/secrets.raw" --secrets-ere-out "$RUNNER_TEMP/secrets.ere"
+          sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/secrets.raw" "$RUNNER_TEMP/secrets.ere"
+          while IFS= read -r value; do echo "::add-mask::$value"; done < "$RUNNER_TEMP/secrets.raw"
+
+      - name: Split layers
+        run: |
+          sudo python3 scripts/pkgsets.py --root /mnt/root --exclude exclude --base-extra base-extra --out build
+          sudo chown -R "$(id -u):$(id -g)" build
+          {
+            echo "### Layers for ${BUILDID}"
+            echo '```json'
+            cat build/summary.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create layer tarballs
+        run: |
+          for v in base base-devel full; do
+            sudo tar --create --no-recursion --null --verbatim-files-from \
+                -C /mnt/root --files-from "$GITHUB_WORKSPACE/build/$v.list" \
+                --numeric-owner --xattrs --xattrs-include=security.capability --acls \
+              | zstd -T0 -3 --long -q -o "build/$v.tar.zst"
+          done
+          ls -l build
+
+      - name: Unmount rootfs
+        if: always()
+        run: |
+          sudo umount /mnt/root /mnt/lower || true
+          sudo rm -rf "$RUNNER_TEMP/rootfs.img" "$RUNNER_TEMP/upper" "$RUNNER_TEMP/work" "$RUNNER_TEMP/bundle"
+          df -h /
+
+      - name: Secret gate
+        run: |
+          zstd -tq build/*.tar.zst
+          cat secret-patterns "$RUNNER_TEMP/secrets.ere" > build/all-patterns
+          for v in base base-devel full; do
+            n=$(zstd -dcq "build/$v.tar.zst" | grep -a -c -E -f build/all-patterns || true)
+            if [ "$n" != 0 ]; then
+              echo "::error::$v layer has $n line(s) matching secret patterns"
+              exit 1
+            fi
+          done
+
+      - name: Build images
+        run: |
+          python3 scripts/tags.py bake --image "$IMAGE" --buildid "$BUILDID" --branches "$BRANCHES" > build/tags.env
+          set -a
+          # shellcheck disable=SC1091
+          . build/tags.env
+          set +a
+          export SOURCE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" REVISION="$GITHUB_SHA"
+          CREATED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          export CREATED
+          docker buildx bake --load
+          rm build/*.tar.zst
+
+      - name: Smoke test
+        run: |
+          for v in base base-devel full; do
+            docker run --rm -v "$GITHUB_WORKSPACE/build:/check:ro" "$IMAGE:$v-$BUILDID" bash -euo pipefail -c '
+              . /etc/os-release
+              [ "$ID" = steamos ] && [ "$BUILD_ID" = "$1" ]
+              { pacman -Qkq 2>/dev/null || true; } | sort > /tmp/missing
+              unexpected=$(comm -23 /tmp/missing <(sort "/check/$2.missing"))
+              if [ -n "$unexpected" ]; then echo "$unexpected"; exit 1; fi
+              pacman -Dk
+              ! grep -rIlsE -f /check/all-patterns /etc /usr/lib/holo
+            ' _ "$BUILDID" "$v"
+          done
+          docker run --rm "$IMAGE:base-devel-$BUILDID" bash -euo pipefail -c '
+            printf "#include <stdio.h>\nint main(void) { puts(\"ok\"); }\n" | gcc -x c - -o /tmp/hello
+            /tmp/hello
+          '
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        id: push
+        run: |
+          for v in base base-devel full; do
+            python3 scripts/tags.py list --image "$IMAGE" --buildid "$BUILDID" --branches "$BRANCHES" --variant "$v" \
+              | while read -r ref; do docker push -q "$ref"; done
+            digest=$(skopeo inspect --raw "docker://$IMAGE:$v-$BUILDID" | sha256sum | cut -d' ' -f1)
+            echo "${v//-/_}=sha256:$digest" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.push.outputs.base }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.push.outputs.base_devel }}
+          push-to-registry: true
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.push.outputs.full }}
+          push-to-registry: true

@@ -1,0 +1,114 @@
+name: check
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Only handle the build this meta-server branch points at
+        type: string
+        default: ""
+      force:
+        description: Rebuild even if the image already exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  META_URL: ${{ vars.META_URL || 'https://steamdeck-atomupd.steamos.cloud/meta' }}
+  IMAGES_URL: ${{ vars.IMAGES_URL || 'https://steamdeck-images.steamos.cloud/' }}
+  USER_AGENT: holo-deckard (+${{ github.server_url }}/${{ github.repository }})
+
+jobs:
+  resolve:
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      retag: ${{ steps.plan.outputs.retag }}
+      has_build: ${{ steps.plan.outputs.has_build }}
+      has_retag: ${{ steps.plan.outputs.has_retag }}
+      image: ${{ steps.image.outputs.image }}
+      meta_url: ${{ env.META_URL }}
+      images_url: ${{ env.IMAGES_URL }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/holo-deckard" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: plan
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          BRANCH: ${{ inputs.branch }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=(--meta-url "$META_URL" --image "$IMAGE" --github-output "$GITHUB_OUTPUT")
+          if [ -n "$BRANCH" ]; then args+=(--branch "$BRANCH"); fi
+          if [ "$FORCE" = true ]; then args+=(--force); fi
+          python3 scripts/resolve.py "${args[@]}"
+
+  retag:
+    needs: resolve
+    if: needs.resolve.outputs.has_retag == 'true'
+    runs-on: ubuntu-26.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - env:
+          RETAG: ${{ needs.resolve.outputs.retag }}
+        run: |
+          jq -c '.[]' <<< "$RETAG" | while read -r item; do
+            src=$(jq -r .source <<< "$item")
+            jq -r '.tags[]' <<< "$item" | while read -r dst; do
+              echo "$src -> $dst"
+              skopeo copy --all --preserve-digests "docker://$src" "docker://$dst"
+            done
+          done
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.has_build == 'true'
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.build) }}
+      max-parallel: 1
+      fail-fast: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/build.yml
+    with:
+      buildid: ${{ matrix.buildid }}
+      version: ${{ matrix.version }}
+      image_branch: ${{ matrix.image_branch }}
+      branches: ${{ join(matrix.branches, ',') }}
+      update_path: ${{ matrix.update_path }}
+      chunks_store_path: ${{ matrix.chunks_store_path }}
+      image: ${{ needs.resolve.outputs.image }}
+      meta_url: ${{ needs.resolve.outputs.meta_url }}
+      images_url: ${{ needs.resolve.outputs.images_url }}

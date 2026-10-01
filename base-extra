@@ -1,0 +1,7 @@
+etc/os-release
+etc/locale.conf
+etc/localtime
+etc/subuid
+etc/subgid
+etc/ca-certificates/extracted/*
+etc/ssl/certs/*

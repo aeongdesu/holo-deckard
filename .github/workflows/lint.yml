@@ -1,0 +1,27 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run actionlint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view -R rhysd/actionlint --json tagName -q .tagName)
+          echo "actionlint $tag"
+          dir="$RUNNER_TEMP/actionlint"
+          mkdir -p "$dir"
+          gh release download "$tag" -R rhysd/actionlint -D "$dir" \
+            -p "actionlint_*_linux_arm64.tar.gz" -p "actionlint_*_checksums.txt"
+          (cd "$dir" && sha256sum -c --ignore-missing actionlint_*_checksums.txt)
+          tar -xzf "$dir"/actionlint_*_linux_arm64.tar.gz -C "$dir" actionlint
+          "$dir/actionlint" -color
