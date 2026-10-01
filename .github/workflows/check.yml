@@ -94,7 +94,7 @@ jobs:
     strategy:
       matrix:
         include: ${{ fromJSON(needs.resolve.outputs.build) }}
-      max-parallel: 1
+      max-parallel: 2
       fail-fast: false
     permissions:
       contents: read
