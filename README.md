@@ -13,17 +13,22 @@ Automatically fetch update branches from atomupd server for every hour, build Do
 
 
 ## Tags
+`latest` is `base-stable`
+
 - `base`
 - `base-devel`
 - `full` - untouched, included all
 - `{variant}-{buildid}` - pinned version, ex) `base-20260922.6101926`
+
+You can also use branch tags like `base-devel-beta`, `base-main`, etc.
+
 
 ## Usage
 ```bash
 docker run -it --rm ghcr.io/aeongdesu/holo-deckard:latest
 ```
 
----
 
+---
 
 This repository is derived from [archlinux/archlinux-docker](https://gitlab.archlinux.org/archlinux/archlinux-docker)
