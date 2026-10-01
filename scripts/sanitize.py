@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strip credentials and private repository URLs from a SteamOS root filesystem."""
+"""Strip credentials and tokenized repository URLs from a SteamOS root filesystem."""
 
 import argparse
 import os
@@ -10,7 +10,6 @@ TOKEN_RE = re.compile(r"_([0-9a-f]{64})_DO_NOT_SHARE_URL")
 TOKEN_URL_RE = re.compile(r"(https?://[^/\s]+/[A-Za-z0-9.-]+)_[0-9a-f]{64}_DO_NOT_SHARE_URL")
 USERINFO_RE = re.compile(r"(https?://)([^/@\s:]+):([^/@\s]+)@")
 CRED_RE = re.compile(r"^\s*(username|password)\s*=\s*(.*?)\s*$", re.I)
-PRIVATE_REPO_PREFIX = "deckard-arch-hotfixes"
 SECTION_RE = re.compile(r"^\s*\[([^\]]+)\]\s*$")
 MAX_TEXT_SIZE = 1 << 20
 ERE_SPECIAL = set(".[]{}()\\*+?^$|")
@@ -61,32 +60,17 @@ def ere_escape(s):
     return "".join("\\" + c if c in ERE_SPECIAL else c for c in s)
 
 
-def pacman_dbpath(conf_text):
-    section = None
-    for line in conf_text.splitlines():
-        m = SECTION_RE.match(line)
-        if m:
-            section = m.group(1)
-        elif section == "options" and re.match(r"^\s*DBPath\s*=", line):
-            return line.split("=", 1)[1].strip()
-    return "/var/lib/pacman/"
-
-
 def rewrite_pacman_conf(text):
-    """Drop private repos, point token URLs at their public paths, mark those repos unsigned."""
-    out, dropped = [], []
-    sections = [(None, [])]
+    """Point token URLs at their public paths and mark those repos unsigned."""
+    out = []
+    sections = [[]]
     for line in text.splitlines(keepends=True):
-        m = SECTION_RE.match(line)
-        if m:
-            sections.append((m.group(1), [line]))
+        if SECTION_RE.match(line):
+            sections.append([line])
         else:
-            sections[-1][1].append(line)
+            sections[-1].append(line)
 
-    for name, lines in sections:
-        if name and name.startswith(PRIVATE_REPO_PREFIX):
-            dropped.append(name)
-            continue
+    for lines in sections:
         rewritten = False
         new = []
         for line in lines:
@@ -101,7 +85,7 @@ def rewrite_pacman_conf(text):
     result = "".join(out)
     if TOKEN_RE.search(result):
         raise ValueError("pacman.conf still contains a private token")
-    return result, dropped
+    return result
 
 
 def strip_credentials(text):
@@ -168,19 +152,11 @@ def sanitize(root):
 
     conf_path = os.path.join(etc, "pacman.conf")
     conf = _read_text(conf_path)
-    dropped = []
     if conf is not None:
-        new_conf, dropped = rewrite_pacman_conf(conf)
+        new_conf = rewrite_pacman_conf(conf)
         if new_conf != conf:
             _write_text(conf_path, new_conf)
-            log.append(f"pacman.conf: rewritten, dropped {dropped or 'nothing'}")
-        dbpath = pacman_dbpath(new_conf).lstrip("/")
-        for repo in dropped:
-            for ext in (".db", ".files", ".db.sig", ".files.sig"):
-                p = os.path.join(root, dbpath, "sync", repo + ext)
-                if os.path.lexists(p):
-                    os.unlink(p)
-                    log.append(f"removed {os.path.relpath(p, root)}")
+            log.append("pacman.conf: token URLs rewritten to public paths")
 
     for path in _etc_files(root):
         if path == conf_path:
