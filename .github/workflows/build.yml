@@ -148,7 +148,7 @@ jobs:
           fi
           desync_conf=/mnt/root/etc/desync/config.json
           host=$(sed -E 's#^https?://([^/]+).*#\1#' <<< "$IMAGES_URL")
-          if [ -f "$desync_conf" ] && ! jq -e --arg h "$host" '."store-options" // {} | keys | any(contains($h))' "$desync_conf" > /dev/null; then
+          if sudo test -f "$desync_conf" && ! sudo jq -e --arg h "$host" '."store-options" // {} | keys | any(contains($h))' "$desync_conf" > /dev/null; then
             echo "::warning::$desync_conf does not reference $host"
           fi
 
