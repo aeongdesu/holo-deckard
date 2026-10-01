@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   actionlint:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v7
       - name: Run actionlint
@@ -21,7 +21,7 @@ jobs:
           dir="$RUNNER_TEMP/actionlint"
           mkdir -p "$dir"
           gh release download "$tag" -R rhysd/actionlint -D "$dir" \
-            -p "actionlint_*_linux_arm64.tar.gz" -p "actionlint_*_checksums.txt"
+            -p "actionlint_*_linux_amd64.tar.gz" -p "actionlint_*_checksums.txt"
           (cd "$dir" && sha256sum -c --ignore-missing actionlint_*_checksums.txt)
-          tar -xzf "$dir"/actionlint_*_linux_arm64.tar.gz -C "$dir" actionlint
+          tar -xzf "$dir"/actionlint_*_linux_amd64.tar.gz -C "$dir" actionlint
           "$dir/actionlint" -color
